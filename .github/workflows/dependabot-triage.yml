@@ -59,22 +59,32 @@ jobs:
 
           # Method 3: セキュリティアラートなし（バージョンアップデートのみ）の場合、
           # パッケージ単位で critical アラートが存在するか確認
+          # PR 作成直後はアラートが API に反映されていない場合があるため最大3回リトライする
           if [ "$IS_CRITICAL" -eq 0 ] && [ -z "${GHSA_ID:-}" ]; then
-            while IFS= read -r pkg; do
-              pkg=$(echo "$pkg" | sed 's/^ *//;s/ *$//')
-              [ -z "$pkg" ] && continue
-              sev=$(gh api "repos/${REPO}/dependabot/alerts?state=open&severity=critical&package=${pkg}&per_page=1" \
-                --jq '.[0].security_vulnerability.severity // empty' 2>/dev/null) || sev=""
-              echo "[Method 3] ${pkg}: severity='${sev}'"
-              if [ "${sev}" = "critical" ]; then
-                IS_CRITICAL=1
-                GHSA_ID=$(gh api "repos/${REPO}/dependabot/alerts?state=open&severity=critical&package=${pkg}&per_page=1" \
-                  --jq '.[0].security_advisory.ghsa_id // "unknown"' 2>/dev/null) || GHSA_ID="unknown"
-                DETECTED_BY="package ${pkg} has critical alert (${GHSA_ID})"
-                echo "Critical アラートを検出: ${pkg} (${GHSA_ID})"
-                break
+            for attempt in 1 2 3; do
+              if [ "$attempt" -gt 1 ]; then
+                echo "[Method 3] アラートが未反映の可能性があります。20秒後にリトライ (${attempt}/3)..."
+                sleep 20
               fi
-            done < <(echo "$DEP_NAMES" | tr ',' '\n')
+              critical_found=0
+              while IFS= read -r pkg; do
+                pkg=$(echo "$pkg" | sed 's/^ *//;s/ *$//')
+                [ -z "$pkg" ] && continue
+                sev=$(gh api "repos/${REPO}/dependabot/alerts?state=open&severity=critical&package=${pkg}&per_page=1" \
+                  --jq '.[0].security_vulnerability.severity // empty' 2>/dev/null) || sev=""
+                echo "[Method 3] attempt ${attempt}: ${pkg}: severity='${sev}'"
+                if [ "${sev}" = "critical" ]; then
+                  IS_CRITICAL=1
+                  GHSA_ID=$(gh api "repos/${REPO}/dependabot/alerts?state=open&severity=critical&package=${pkg}&per_page=1" \
+                    --jq '.[0].security_advisory.ghsa_id // "unknown"' 2>/dev/null) || GHSA_ID="unknown"
+                  DETECTED_BY="package ${pkg} has critical alert (${GHSA_ID})"
+                  echo "Critical アラートを検出: ${pkg} (${GHSA_ID})"
+                  critical_found=1
+                  break
+                fi
+              done < <(echo "$DEP_NAMES" | tr ',' '\n')
+              [ "$critical_found" -eq 1 ] && break
+            done
           fi
 
           echo "IS_CRITICAL=${IS_CRITICAL} DETECTED_BY=${DETECTED_BY}"

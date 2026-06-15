@@ -3,6 +3,6 @@
   "version": "1.0.0",
   "dependencies": {
     "handlebars": "4.7.6",
-    "fast-xml-parser": "4.4.0"
+    "fast-xml-parser": "5.9.0"
   }
 }

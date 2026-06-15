@@ -1,0 +1,96 @@
+name: Dependabot PR Triage
+
+on:
+  pull_request:
+    types: [opened]
+
+permissions:
+  pull-requests: write
+  contents: read
+  security-events: read
+
+jobs:
+  triage:
+    runs-on: ubuntu-latest
+    if: github.actor == 'dependabot[bot]'
+    steps:
+      - name: Fetch Dependabot metadata
+        id: meta
+        uses: dependabot/fetch-metadata@v2
+        with:
+          alert-lookup: true
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Triage PR based on severity
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          CVSS: ${{ steps.meta.outputs.cvss }}
+          GHSA_ID: ${{ steps.meta.outputs.ghsa-id }}
+          DEP_NAMES: ${{ steps.meta.outputs.dependency-names }}
+          UPDATE_TYPE: ${{ steps.meta.outputs.update-type }}
+        run: |
+          IS_CRITICAL=0
+          DETECTED_BY=""
+
+          echo "CVSS=${CVSS} GHSA_ID=${GHSA_ID} DEP_NAMES=${DEP_NAMES}"
+
+          # Method 1: fetch-metadata の CVSS スコアで判定（>= 9.0 = Critical）
+          # fetch-metadata@v2 は severity フィールドを出力しないため CVSS を使用する
+          if [ -n "${CVSS}" ] && [ "${CVSS}" != "0" ]; then
+            if awk "BEGIN{exit !($CVSS >= 9.0)}"; then
+              IS_CRITICAL=1
+              DETECTED_BY="CVSS score ${CVSS}"
+            fi
+          fi
+
+          # Method 2: GHSA ID が取得できた場合、Dependabot alerts API で severity を直接確認
+          if [ "$IS_CRITICAL" -eq 0 ] && [ -n "${GHSA_ID}" ]; then
+            sev=$(gh api "repos/${REPO}/dependabot/alerts?state=open&per_page=100" \
+              --jq "[.[] | select(.security_advisory.ghsa_id == \"${GHSA_ID}\")] | .[0].security_vulnerability.severity // empty" \
+              2>/dev/null) || sev=""
+            echo "GHSA ${GHSA_ID} severity from API: '${sev}'"
+            if [ "${sev}" = "critical" ]; then
+              IS_CRITICAL=1
+              DETECTED_BY="GHSA ${GHSA_ID} (API severity: critical)"
+            fi
+          fi
+
+          # Method 3: セキュリティアラートなし（バージョンアップデートのみ）の場合、
+          # パッケージ単位で critical アラートが存在するか確認
+          if [ "$IS_CRITICAL" -eq 0 ] && [ -z "${GHSA_ID:-}" ]; then
+            while IFS= read -r pkg; do
+              pkg=$(echo "$pkg" | sed 's/^ *//;s/ *$//')
+              [ -z "$pkg" ] && continue
+              sev=$(gh api "repos/${REPO}/dependabot/alerts?state=open&severity=critical&package=${pkg}&per_page=1" \
+                --jq '.[0].security_vulnerability.severity // empty' 2>/dev/null) || sev=""
+              echo "[Method 3] ${pkg}: severity='${sev}'"
+              if [ "${sev}" = "critical" ]; then
+                IS_CRITICAL=1
+                GHSA_ID=$(gh api "repos/${REPO}/dependabot/alerts?state=open&severity=critical&package=${pkg}&per_page=1" \
+                  --jq '.[0].security_advisory.ghsa_id // "unknown"' 2>/dev/null) || GHSA_ID="unknown"
+                DETECTED_BY="package ${pkg} has critical alert (${GHSA_ID})"
+                echo "Critical アラートを検出: ${pkg} (${GHSA_ID})"
+                break
+              fi
+            done < <(echo "$DEP_NAMES" | tr ',' '\n')
+          fi
+
+          echo "IS_CRITICAL=${IS_CRITICAL} DETECTED_BY=${DETECTED_BY}"
+
+          if [ "$IS_CRITICAL" -eq 1 ]; then
+            echo "Critical. Keeping open."
+            BODY=$(printf '## Critical セキュリティ脆弱性\n\n**このPRは重要なセキュリティ修正を含むため、オープンのままにしています。**\n\n- 対象パッケージ: `%s`\n- GHSA ID: `%s`\n- 検出方法: %s\n\n速やかなレビューとマージを推奨します。' "$DEP_NAMES" "${GHSA_ID:-N/A}" "$DETECTED_BY")
+            gh pr comment "$PR_NUMBER" --repo "$REPO" --body "$BODY"
+          else
+            echo "Non-critical. Closing."
+            if [ -z "${GHSA_ID:-}" ]; then
+              REASON="セキュリティアラートなし（バージョンアップデートのみ）"
+            else
+              REASON="GHSA \`${GHSA_ID}\`（Critical 未満）"
+            fi
+            BODY=$(printf '## Dependabot PR 自動クローズ\n\nこのPRは自動的にクローズされました。\n\n**理由**: %s\n- 対象パッケージ: `%s`\n- 更新タイプ: `%s`\n\nCritical 深刻度の脆弱性修正のみ手動レビューが必要です。' "$REASON" "$DEP_NAMES" "$UPDATE_TYPE")
+            gh pr comment "$PR_NUMBER" --repo "$REPO" --body "$BODY"
+            gh pr close "$PR_NUMBER" --repo "$REPO"
+          fi

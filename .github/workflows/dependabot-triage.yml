@@ -3,20 +3,6 @@ name: Dependabot PR Triage
 on:
   pull_request:
     types: [opened]
-  workflow_dispatch:
-    inputs:
-      dependency_names:
-        description: 'Dependency names to test (comma-separated)'
-        required: true
-        default: 'fast-xml-parser'
-      package_ecosystem:
-        description: 'Package ecosystem'
-        required: true
-        default: 'npm_and_yarn'
-      pr_number:
-        description: 'PR number to comment/close (optional)'
-        required: false
-        default: ''
 
 permissions:
   pull-requests: write
@@ -25,11 +11,10 @@ permissions:
 jobs:
   triage:
     runs-on: ubuntu-latest
-    if: github.actor == 'dependabot[bot]' || github.event_name == 'workflow_dispatch'
+    if: github.actor == 'dependabot[bot]'
     steps:
       - name: Fetch Dependabot metadata
         id: meta
-        if: github.event_name != 'workflow_dispatch'
         uses: dependabot/fetch-metadata@v2
         with:
           # alert-lookup は GITHUB_TOKEN では機能しない（Dependabot alerts API へのアクセスに
@@ -41,16 +26,16 @@ jobs:
       - name: Triage PR based on severity
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR_NUMBER: ${{ github.event.inputs.pr_number || github.event.pull_request.number }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
           REPO: ${{ github.repository }}
-          DEP_NAMES: ${{ github.event.inputs.dependency_names || steps.meta.outputs.dependency-names }}
-          PKG_ECOSYSTEM: ${{ github.event.inputs.package_ecosystem || steps.meta.outputs.package-ecosystem }}
-          UPDATE_TYPE: ${{ steps.meta.outputs.update-type || 'version-update:semver-major' }}
+          DEP_NAMES: ${{ steps.meta.outputs.dependency-names }}
+          PKG_ECOSYSTEM: ${{ steps.meta.outputs.package-ecosystem }}
+          UPDATE_TYPE: ${{ steps.meta.outputs.update-type }}
         run: |
           IS_CRITICAL=0
           DETECTED_BY=""
 
-          echo "DEP_NAMES=${DEP_NAMES} PKG_ECOSYSTEM=${PKG_ECOSYSTEM} PREV_VERSION=${PREV_VERSION}"
+          echo "DEP_NAMES=${DEP_NAMES} PKG_ECOSYSTEM=${PKG_ECOSYSTEM}"
 
           # fetch-metadata の package-ecosystem 出力を Advisory Database API 用に変換
           # https://docs.github.com/ja/rest/security-advisories/global-advisories#list-global-security-advisories

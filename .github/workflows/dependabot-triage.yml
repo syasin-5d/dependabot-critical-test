@@ -7,7 +7,6 @@ on:
 permissions:
   pull-requests: write
   contents: read
-  security-events: read
 
 jobs:
   triage:
@@ -19,11 +18,15 @@ jobs:
         uses: dependabot/fetch-metadata@v2
         with:
           alert-lookup: true
-          github-token: ${{ secrets.GITHUB_TOKEN }}
+          # Dependabot alerts API には repo/public_repo スコープが必要。
+          # GITHUB_TOKEN (security-events: read) では 403 となるため、
+          # PAT (Personal Access Token) を secrets.DEPENDABOT_ALERTS_TOKEN に設定すること。
+          github-token: ${{ secrets.DEPENDABOT_ALERTS_TOKEN || secrets.GITHUB_TOKEN }}
 
       - name: Triage PR based on severity
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.DEPENDABOT_ALERTS_TOKEN || secrets.GITHUB_TOKEN }}
+          HAS_PAT: ${{ secrets.DEPENDABOT_ALERTS_TOKEN != '' }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           REPO: ${{ github.repository }}
           CVSS: ${{ steps.meta.outputs.cvss }}
@@ -31,11 +34,10 @@ jobs:
           DEP_NAMES: ${{ steps.meta.outputs.dependency-names }}
           UPDATE_TYPE: ${{ steps.meta.outputs.update-type }}
         run: |
-          set -x
           IS_CRITICAL=0
           DETECTED_BY=""
 
-          echo "CVSS=${CVSS} GHSA_ID=${GHSA_ID} DEP_NAMES=${DEP_NAMES}"
+          echo "CVSS=${CVSS} GHSA_ID=${GHSA_ID} DEP_NAMES=${DEP_NAMES} HAS_PAT=${HAS_PAT}"
 
           # Method 1: fetch-metadata の CVSS スコアで判定（>= 9.0 = Critical）
           # fetch-metadata@v2 は severity フィールドを出力しないため CVSS を使用する
@@ -58,7 +60,7 @@ jobs:
             fi
           fi
 
-          # Method 3: セキュリティアラートなし（バージョンアップデートのみ）の場合、
+          # Method 3: fetch-metadata がアラート情報を返さない場合、
           # パッケージ単位で critical アラートが存在するか確認
           # PR 作成直後はアラートが API に反映されていない場合があるため最大3回リトライする
           if [ "$IS_CRITICAL" -eq 0 ] && [ -z "${GHSA_ID:-}" ]; then
@@ -71,11 +73,9 @@ jobs:
               while IFS= read -r pkg; do
                 pkg=$(echo "$pkg" | sed 's/^ *//;s/ *$//')
                 [ -z "$pkg" ] && continue
-                # エラー出力を確認するため一時的に stderr を保持
-                api_out=$(gh api "repos/${REPO}/dependabot/alerts?state=open&severity=critical&package=${pkg}&per_page=1" \
-                  --jq '.[0].security_vulnerability.severity // empty' 2>&1) || true
-                echo "[Method 3] attempt ${attempt}: ${pkg}: raw_api_out='${api_out}'"
-                sev="${api_out}"
+                sev=$(gh api "repos/${REPO}/dependabot/alerts?state=open&severity=critical&package=${pkg}&per_page=1" \
+                  --jq '.[0].security_vulnerability.severity // empty' 2>/dev/null) || sev=""
+                echo "[Method 3] attempt ${attempt}: ${pkg}: severity='${sev}'"
                 if [ "${sev}" = "critical" ]; then
                   IS_CRITICAL=1
                   GHSA_ID=$(gh api "repos/${REPO}/dependabot/alerts?state=open&severity=critical&package=${pkg}&per_page=1" \

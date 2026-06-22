@@ -3,6 +3,16 @@ name: Dependabot PR Triage
 on:
   pull_request:
     types: [opened, reopened]
+  workflow_dispatch:
+    inputs:
+      dependency_names:
+        description: 'Dependency names to test (comma-separated)'
+        required: true
+        default: 'fast-xml-parser'
+      pr_number:
+        description: 'PR number to comment/close (optional)'
+        required: false
+        default: ''
 
 permissions:
   pull-requests: write
@@ -11,10 +21,11 @@ permissions:
 jobs:
   triage:
     runs-on: ubuntu-latest
-    if: github.actor == 'dependabot[bot]'
+    if: github.actor == 'dependabot[bot]' || github.event_name == 'workflow_dispatch'
     steps:
       - name: Fetch Dependabot metadata
         id: meta
+        if: github.event_name != 'workflow_dispatch'
         uses: dependabot/fetch-metadata@v2
         with:
           alert-lookup: true
@@ -27,12 +38,12 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.DEPENDABOT_ALERTS_TOKEN || secrets.GITHUB_TOKEN }}
           HAS_PAT: ${{ secrets.DEPENDABOT_ALERTS_TOKEN != '' }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_NUMBER: ${{ github.event.inputs.pr_number || github.event.pull_request.number }}
           REPO: ${{ github.repository }}
           CVSS: ${{ steps.meta.outputs.cvss }}
           GHSA_ID: ${{ steps.meta.outputs.ghsa-id }}
-          DEP_NAMES: ${{ steps.meta.outputs.dependency-names }}
-          UPDATE_TYPE: ${{ steps.meta.outputs.update-type }}
+          DEP_NAMES: ${{ github.event.inputs.dependency_names || steps.meta.outputs.dependency-names }}
+          UPDATE_TYPE: ${{ steps.meta.outputs.update-type || 'version-update:semver-major' }}
         run: |
           IS_CRITICAL=0
           DETECTED_BY=""

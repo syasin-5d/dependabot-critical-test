@@ -31,6 +31,7 @@ jobs:
           DEP_NAMES: ${{ steps.meta.outputs.dependency-names }}
           UPDATE_TYPE: ${{ steps.meta.outputs.update-type }}
         run: |
+          set -x
           IS_CRITICAL=0
           DETECTED_BY=""
 
@@ -70,9 +71,11 @@ jobs:
               while IFS= read -r pkg; do
                 pkg=$(echo "$pkg" | sed 's/^ *//;s/ *$//')
                 [ -z "$pkg" ] && continue
-                sev=$(gh api "repos/${REPO}/dependabot/alerts?state=open&severity=critical&package=${pkg}&per_page=1" \
-                  --jq '.[0].security_vulnerability.severity // empty' 2>/dev/null) || sev=""
-                echo "[Method 3] attempt ${attempt}: ${pkg}: severity='${sev}'"
+                # エラー出力を確認するため一時的に stderr を保持
+                api_out=$(gh api "repos/${REPO}/dependabot/alerts?state=open&severity=critical&package=${pkg}&per_page=1" \
+                  --jq '.[0].security_vulnerability.severity // empty' 2>&1) || true
+                echo "[Method 3] attempt ${attempt}: ${pkg}: raw_api_out='${api_out}'"
+                sev="${api_out}"
                 if [ "${sev}" = "critical" ]; then
                   IS_CRITICAL=1
                   GHSA_ID=$(gh api "repos/${REPO}/dependabot/alerts?state=open&severity=critical&package=${pkg}&per_page=1" \

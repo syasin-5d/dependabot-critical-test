@@ -12,7 +12,8 @@ permissions:
 jobs:
   triage:
     runs-on: ubuntu-latest
-    if: github.actor == 'dependabot[bot]'
+    # DEBUG: temporarily allow manual PRs for testing
+    # if: github.actor == 'dependabot[bot]'
     steps:
       - name: Fetch Dependabot metadata
         id: meta

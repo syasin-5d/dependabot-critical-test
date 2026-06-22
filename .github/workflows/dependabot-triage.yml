@@ -17,93 +17,73 @@ jobs:
         id: meta
         uses: dependabot/fetch-metadata@v2
         with:
-          alert-lookup: true
-          # Dependabot alerts API には repo/public_repo スコープが必要。
-          # GITHUB_TOKEN (security-events: read) では 403 となるため、
-          # PAT (Personal Access Token) を secrets.DEPENDABOT_ALERTS_TOKEN に設定すること。
-          github-token: ${{ secrets.DEPENDABOT_ALERTS_TOKEN || secrets.GITHUB_TOKEN }}
+          # alert-lookup は GITHUB_TOKEN では機能しない（Dependabot alerts API へのアクセスに
+          # repo/public_repo スコープが必要なため）。基本メタデータ（dependency-names,
+          # package-ecosystem, previous-version 等）は GITHUB_TOKEN でも取得可能。
+          alert-lookup: false
+          github-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Triage PR based on severity
         env:
-          GH_TOKEN: ${{ secrets.DEPENDABOT_ALERTS_TOKEN || secrets.GITHUB_TOKEN }}
-          HAS_PAT: ${{ secrets.DEPENDABOT_ALERTS_TOKEN != '' }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           REPO: ${{ github.repository }}
-          CVSS: ${{ steps.meta.outputs.cvss }}
-          GHSA_ID: ${{ steps.meta.outputs.ghsa-id }}
           DEP_NAMES: ${{ steps.meta.outputs.dependency-names }}
+          PKG_ECOSYSTEM: ${{ steps.meta.outputs.package-ecosystem }}
+          PREV_VERSION: ${{ steps.meta.outputs.previous-version }}
           UPDATE_TYPE: ${{ steps.meta.outputs.update-type }}
         run: |
           IS_CRITICAL=0
           DETECTED_BY=""
 
-          echo "CVSS=${CVSS} GHSA_ID=${GHSA_ID} DEP_NAMES=${DEP_NAMES} HAS_PAT=${HAS_PAT}"
+          echo "DEP_NAMES=${DEP_NAMES} PKG_ECOSYSTEM=${PKG_ECOSYSTEM} PREV_VERSION=${PREV_VERSION}"
 
-          # Method 1: fetch-metadata の CVSS スコアで判定（>= 9.0 = Critical）
-          # fetch-metadata@v2 は severity フィールドを出力しないため CVSS を使用する
-          if [ -n "${CVSS}" ] && [ "${CVSS}" != "0" ]; then
-            if awk "BEGIN{exit !($CVSS >= 9.0)}"; then
-              IS_CRITICAL=1
-              DETECTED_BY="CVSS score ${CVSS}"
-            fi
-          fi
+          # fetch-metadata の package-ecosystem 出力を Advisory Database API 用に変換
+          # https://docs.github.com/ja/rest/security-advisories/global-advisories#list-global-security-advisories
+          case "${PKG_ECOSYSTEM}" in
+            npm_and_yarn) ECOSYSTEM="npm" ;;
+            pip)          ECOSYSTEM="pip" ;;
+            maven)        ECOSYSTEM="maven" ;;
+            gradle)       ECOSYSTEM="gradle" ;;
+            bundler)      ECOSYSTEM="rubygems" ;;
+            composer)     ECOSYSTEM="composer" ;;
+            go_modules)   ECOSYSTEM="go" ;;
+            cargo)        ECOSYSTEM="rust" ;;
+            nuget)        ECOSYSTEM="nuget" ;;
+            *)            ECOSYSTEM="${PKG_ECOSYSTEM}" ;;
+          esac
 
-          # Method 2: GHSA ID が取得できた場合、Dependabot alerts API で severity を直接確認
-          if [ "$IS_CRITICAL" -eq 0 ] && [ -n "${GHSA_ID}" ]; then
-            sev=$(gh api "repos/${REPO}/dependabot/alerts?state=open&per_page=100" \
-              --jq "[.[] | select(.security_advisory.ghsa_id == \"${GHSA_ID}\")] | .[0].security_vulnerability.severity // empty" \
-              2>/dev/null) || sev=""
-            echo "GHSA ${GHSA_ID} severity from API: '${sev}'"
+          # GitHub Advisory Database API（パブリックAPI・認証不要）で
+          # パッケージ単位の critical アドバイザリを検索
+          while IFS= read -r pkg; do
+            pkg=$(echo "$pkg" | sed 's/^ *//;s/ *$//')
+            [ -z "$pkg" ] && continue
+
+            echo "Checking Advisory Database for ${pkg} (${ECOSYSTEM})..."
+            advisory=$(curl -s "https://api.github.com/advisories?package_name=${pkg}&ecosystem=${ECOSYSTEM}&severity=critical&per_page=1")
+            sev=$(echo "$advisory" | jq -r '.[0].severity // empty')
+            ghsa=$(echo "$advisory" | jq -r '.[0].ghsa_id // empty')
+            cvss=$(echo "$advisory" | jq -r '.[0].cvss.score // empty')
+
+            echo "  severity='${sev}' ghsa='${ghsa}' cvss='${cvss}'"
+
             if [ "${sev}" = "critical" ]; then
               IS_CRITICAL=1
-              DETECTED_BY="GHSA ${GHSA_ID} (API severity: critical)"
+              DETECTED_BY="Advisory Database: ${pkg} has critical advisory (${ghsa}, CVSS ${cvss})"
+              echo "Critical advisory found for ${pkg}"
+              break
             fi
-          fi
-
-          # Method 3: fetch-metadata がアラート情報を返さない場合、
-          # パッケージ単位で critical アラートが存在するか確認
-          # PR 作成直後はアラートが API に反映されていない場合があるため最大3回リトライする
-          if [ "$IS_CRITICAL" -eq 0 ] && [ -z "${GHSA_ID:-}" ]; then
-            for attempt in 1 2 3; do
-              if [ "$attempt" -gt 1 ]; then
-                echo "[Method 3] アラートが未反映の可能性があります。20秒後にリトライ (${attempt}/3)..."
-                sleep 20
-              fi
-              critical_found=0
-              while IFS= read -r pkg; do
-                pkg=$(echo "$pkg" | sed 's/^ *//;s/ *$//')
-                [ -z "$pkg" ] && continue
-                sev=$(gh api "repos/${REPO}/dependabot/alerts?state=open&severity=critical&package=${pkg}&per_page=1" \
-                  --jq '.[0].security_vulnerability.severity // empty' 2>/dev/null) || sev=""
-                echo "[Method 3] attempt ${attempt}: ${pkg}: severity='${sev}'"
-                if [ "${sev}" = "critical" ]; then
-                  IS_CRITICAL=1
-                  GHSA_ID=$(gh api "repos/${REPO}/dependabot/alerts?state=open&severity=critical&package=${pkg}&per_page=1" \
-                    --jq '.[0].security_advisory.ghsa_id // "unknown"' 2>/dev/null) || GHSA_ID="unknown"
-                  DETECTED_BY="package ${pkg} has critical alert (${GHSA_ID})"
-                  echo "Critical アラートを検出: ${pkg} (${GHSA_ID})"
-                  critical_found=1
-                  break
-                fi
-              done < <(echo "$DEP_NAMES" | tr ',' '\n')
-              [ "$critical_found" -eq 1 ] && break
-            done
-          fi
+          done < <(echo "$DEP_NAMES" | tr ',' '\n')
 
           echo "IS_CRITICAL=${IS_CRITICAL} DETECTED_BY=${DETECTED_BY}"
 
           if [ "$IS_CRITICAL" -eq 1 ]; then
             echo "Critical. Keeping open."
-            BODY=$(printf '## Critical セキュリティ脆弱性\n\n**このPRは重要なセキュリティ修正を含むため、オープンのままにしています。**\n\n- 対象パッケージ: `%s`\n- GHSA ID: `%s`\n- 検出方法: %s\n\n速やかなレビューとマージを推奨します。' "$DEP_NAMES" "${GHSA_ID:-N/A}" "$DETECTED_BY")
+            BODY=$(printf '## Critical セキュリティ脆弱性\n\n**このPRは重要なセキュリティ修正を含むため、オープンのままにしています。**\n\n- 対象パッケージ: `%s`\n- 検出方法: %s\n\n速やかなレビューとマージを推奨します。' "$DEP_NAMES" "$DETECTED_BY")
             gh pr comment "$PR_NUMBER" --repo "$REPO" --body "$BODY"
           else
             echo "Non-critical. Closing."
-            if [ -z "${GHSA_ID:-}" ]; then
-              REASON="セキュリティアラートなし（バージョンアップデートのみ）"
-            else
-              REASON="GHSA \`${GHSA_ID}\`（Critical 未満）"
-            fi
-            BODY=$(printf '## Dependabot PR 自動クローズ\n\nこのPRは自動的にクローズされました。\n\n**理由**: %s\n- 対象パッケージ: `%s`\n- 更新タイプ: `%s`\n\nCritical 深刻度の脆弱性修正のみ手動レビューが必要です。' "$REASON" "$DEP_NAMES" "$UPDATE_TYPE")
+            BODY=$(printf '## Dependabot PR 自動クローズ\n\nこのPRは自動的にクローズされました。\n\n**理由**: Advisory Database において、対象パッケージに Critical 深刻度のセキュリティアドバイザリは見つかりませんでした。\n- 対象パッケージ: `%s`\n- 更新タイプ: `%s`\n\nCritical 深刻度の脆弱性修正のみ手動レビューが必要です。' "$DEP_NAMES" "$UPDATE_TYPE")
             gh pr comment "$PR_NUMBER" --repo "$REPO" --body "$BODY"
             gh pr close "$PR_NUMBER" --repo "$REPO"
           fi

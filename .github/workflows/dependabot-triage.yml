@@ -2,7 +2,7 @@ name: Dependabot PR Triage
 
 on:
   pull_request:
-    types: [opened]
+    types: [opened, reopened]
 
 permissions:
   pull-requests: write
@@ -12,16 +12,37 @@ permissions:
 jobs:
   triage:
     runs-on: ubuntu-latest
-    if: github.actor == 'dependabot[bot]'
+    # DEBUG: temporarily allow manual PRs for testing
+    # if: github.actor == 'dependabot[bot]'
     steps:
-      - name: Fetch Dependabot metadata
-        id: meta
-        uses: dependabot/fetch-metadata@v2
-        with:
-          alert-lookup: true
-          github-token: ${{ secrets.GITHUB_TOKEN }}
+      # DEBUG: skip fetch-metadata for testing
+      # - name: Fetch Dependabot metadata
+      #   id: meta
+      #   uses: dependabot/fetch-metadata@v2
+      #   with:
+      #     alert-lookup: true
+      #     github-token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Triage PR based on severity
+      - name: DEBUG Direct API test
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -x
+          echo "=== Testing Dependabot alerts API with GITHUB_TOKEN ==="
+          # Test 1: List all alerts
+          echo "--- Test 1: List all open alerts ---"
+          gh api "repos/${REPO}/dependabot/alerts?state=open&per_page=5" --jq '.[].number' 2>&1 || true
+          # Test 2: Filter by severity critical
+          echo "--- Test 2: Filter by severity=critical ---"
+          gh api "repos/${REPO}/dependabot/alerts?state=open&severity=critical&per_page=5" --jq '.[].number' 2>&1 || true
+          # Test 3: Filter by package
+          echo "--- Test 3: Filter by package=fast-xml-parser ---"
+          gh api "repos/${REPO}/dependabot/alerts?state=open&package=fast-xml-parser&per_page=1" --jq '.[0].security_vulnerability.severity' 2>&1 || true
+          # Test 4: Filter by severity + package
+          echo "--- Test 4: Filter by severity=critical&package=fast-xml-parser ---"
+          gh api "repos/${REPO}/dependabot/alerts?state=open&severity=critical&package=fast-xml-parser&per_page=1" --jq '.[0].security_vulnerability.severity' 2>&1 || true
+          echo "=== Done ==="
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
@@ -31,6 +52,7 @@ jobs:
           DEP_NAMES: ${{ steps.meta.outputs.dependency-names }}
           UPDATE_TYPE: ${{ steps.meta.outputs.update-type }}
         run: |
+          set -x
           IS_CRITICAL=0
           DETECTED_BY=""
 
@@ -70,9 +92,11 @@ jobs:
               while IFS= read -r pkg; do
                 pkg=$(echo "$pkg" | sed 's/^ *//;s/ *$//')
                 [ -z "$pkg" ] && continue
-                sev=$(gh api "repos/${REPO}/dependabot/alerts?state=open&severity=critical&package=${pkg}&per_page=1" \
-                  --jq '.[0].security_vulnerability.severity // empty' 2>/dev/null) || sev=""
-                echo "[Method 3] attempt ${attempt}: ${pkg}: severity='${sev}'"
+                # エラー出力を確認するため一時的に stderr を保持
+                api_out=$(gh api "repos/${REPO}/dependabot/alerts?state=open&severity=critical&package=${pkg}&per_page=1" \
+                  --jq '.[0].security_vulnerability.severity // empty' 2>&1) || true
+                echo "[Method 3] attempt ${attempt}: ${pkg}: raw_api_out='${api_out}'"
+                sev="${api_out}"
                 if [ "${sev}" = "critical" ]; then
                   IS_CRITICAL=1
                   GHSA_ID=$(gh api "repos/${REPO}/dependabot/alerts?state=open&severity=critical&package=${pkg}&per_page=1" \
